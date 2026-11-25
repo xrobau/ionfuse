@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ioncubefs"
+version = "0.1.0"
+description = "Read-only FUSE passthrough filesystem that presents ionCube-encoded PHP as decompiled source"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# The decoder, ioncube_re, is a manually checked-out fork of
+# ardzz/ioncube-decompiler in third_party/ioncube-decompiler (branch
+# missing-opcodes; not a submodule, ignored by this repo) and is packaged
+# into this distribution: see package-dir below.  setup.py stops with clone
+# instructions if it is missing.  It is stdlib-only at runtime and works on
+# 3.11, despite its own pyproject.
+dependencies = ["fuse-python>=1.0.5"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+ioncubefs = "ioncubefs.fs:main"
+ioncube-re = "ioncube_re.cli:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+ioncube_re = "third_party/ioncube-decompiler/src/ioncube_re"
+
+[tool.setuptools.packages.find]
+where = ["src", "third_party/ioncube-decompiler/src"]
+include = ["ioncubefs*", "ioncube_re*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
