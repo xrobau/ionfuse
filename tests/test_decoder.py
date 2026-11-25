@@ -1,6 +1,8 @@
 import os
 
-from ioncubefs.decoder import Decoder
+import pytest
+
+from ioncubefs.decoder import DecodeError, Decoder
 
 ENC = (b"#!/usr/bin/php -q\n<?php //00447\n"
        b"if(extension_loaded('ionCube Loader')){die('x');}\n?>\nPAYLOAD")
@@ -34,7 +36,7 @@ def test_decode_prepends_shebang_and_caches(tmp_path):
     assert len(calls) == 1 and d2.stats["disk_hits"] == 1
 
 
-def test_failure_returns_none_and_is_remembered(tmp_path, caplog):
+def test_failure_defaults_to_error_and_is_remembered(tmp_path, caplog):
     calls = []
 
     def lift(p, c, ierg=None):
@@ -44,10 +46,48 @@ def test_failure_returns_none_and_is_remembered(tmp_path, caplog):
     cache = str(tmp_path / "cache")
     p = _write(tmp_path, "bad.php", ENC)
     d = Decoder(cache, lift=lift)
-    assert d.decode(p) is None
+    with pytest.raises(DecodeError):
+        d.decode(p)
     assert "boom" in caplog.text
-    assert Decoder(cache, lift=lift).decode(p) is None
+    with pytest.raises(DecodeError):
+        Decoder(cache, lift=lift).decode(p)
     assert len(calls) == 1  # failure marker on disk prevents retry
+
+
+def test_failure_can_serve_original_bytes(tmp_path):
+    calls = []
+
+    def lift(p, c, ierg=None):
+        calls.append(p)
+        raise ValueError("boom")
+
+    cache = str(tmp_path / "cache")
+    p = _write(tmp_path, "bad.php", ENC)
+    d = Decoder(cache, lift=lift, on_decode_error="original")
+    assert d.decode(p) is None
+    assert d.decode(p) is None  # memory-cache failure marker
+    assert len(calls) == 1
+
+
+def test_failure_error_is_memory_cached_without_disk(tmp_path):
+    calls = []
+
+    def lift(p, c, ierg=None):
+        calls.append(p)
+        raise ValueError("boom")
+
+    p = _write(tmp_path, "bad.php", ENC)
+    d = Decoder(None, lift=lift)
+    with pytest.raises(DecodeError):
+        d.decode(p)
+    with pytest.raises(DecodeError):
+        d.decode(p)
+    assert len(calls) == 1  # in-memory failure sentinel
+
+
+def test_invalid_decode_error_mode(tmp_path):
+    with pytest.raises(ValueError):
+        Decoder(None, on_decode_error="nonsense")
 
 
 def test_modified_file_is_redecoded(tmp_path):

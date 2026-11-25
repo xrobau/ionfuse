@@ -1,4 +1,5 @@
 """Decode ionCube-encoded files with ioncube_re, with memory + disk caching."""
+import errno
 import hashlib
 import logging
 import os
@@ -9,6 +10,24 @@ from . import detect
 from .cache import MISSING, DiskCache, MemLRU
 
 log = logging.getLogger("ioncubefs")
+
+
+class DecodeError(OSError):
+    """An encoded file was detected but could not be decoded."""
+
+
+class _DecodeFailedSentinel:
+    """Memory-cache marker for a failed decode (not a decoded value)."""
+
+    def __len__(self) -> int:
+        return 0
+
+    def __repr__(self) -> str:
+        return "DECODE_FAILED"
+
+
+DECODE_FAILED = _DecodeFailedSentinel()
+DECODE_ERROR_MODES = ("error", "original")
 
 
 def backend_fingerprint() -> str:
@@ -42,9 +61,13 @@ def _default_lift(path: str, chunk: int, ierg: int | None = None) -> str:
 class Decoder:
     """Turns a real path into decoded bytes, or None to mean "serve original".
 
+    ``on_decode_error`` controls a file that sniffs as encoded but fails to
+    decode: ``"error"`` raises DecodeError (the FUSE driver maps it to EIO);
+    ``"original"`` returns None so the caller serves the original bytes.
+
     Cache layers:
       * sniff cache: (path, size, mtime_ns) -> bool       (cheap header check)
-      * MemLRU:      (path, size, mtime_ns) -> bytes|None
+      * MemLRU:      (path, size, mtime_ns) -> bytes|None|failure sentinel
       * DiskCache:   sha256(content)+backend+chunk+keymap -> bytes | failure marker
 
     ``keymap`` maps real file paths to a keytable mask override (``ierg``).
@@ -54,7 +77,13 @@ class Decoder:
 
     def __init__(self, cache_dir: str | None, mem_bytes: int = 256 << 20,
                  chunk: int = 1, lift=None, max_size: int = 16 << 20,
-                 keymap: dict[str, int] | None = None):
+                 keymap: dict[str, int] | None = None,
+                 on_decode_error: str = "error"):
+        if on_decode_error not in DECODE_ERROR_MODES:
+            raise ValueError(
+                f"on_decode_error must be one of {DECODE_ERROR_MODES}, "
+                f"not {on_decode_error!r}")
+        self.on_decode_error = on_decode_error
         self.chunk = chunk
         self.max_size = max_size
         self._lift = lift or _default_lift
@@ -111,21 +140,33 @@ class Decoder:
         key = self._key(path, st)
         hit = self.mem.get(key)
         if hit is not MISSING:
-            return hit
+            return self._cached_result(path, hit)
         lk = self._lock_for(key)
         with lk:
             hit = self.mem.get(key)  # decoded while we waited?
             if hit is not MISSING:
-                return hit
+                return self._cached_result(path, hit)
             try:
                 result = self._decode_uncached(path)
+            except DecodeError:
+                self.mem.put(key, DECODE_FAILED)
+                if self.on_decode_error == "error":
+                    raise
+                return None
             finally:
                 with self._key_locks_lock:
                     self._key_locks.pop(key, None)
             self.mem.put(key, result)
             return result
 
-    def _decode_uncached(self, path: str) -> bytes | None:
+    def _cached_result(self, path: str, hit) -> bytes | None:
+        if hit is DECODE_FAILED:
+            if self.on_decode_error == "error":
+                raise DecodeError(errno.EIO, f"cached decode failure: {path}")
+            return None
+        return hit
+
+    def _decode_uncached(self, path: str) -> bytes:
         with open(path, "rb") as f:
             raw = f.read()
         sha = hashlib.sha256(raw).hexdigest()
@@ -138,7 +179,8 @@ class Decoder:
                     log.debug("disk cache hit: %s", path)
                     return val
                 log.debug("disk cache (known failure): %s: %s", path, val)
-                return None
+                raise DecodeError(
+                    errno.EIO, f"cannot decode {path}: {val}")
 
         t0 = time.monotonic()
         try:
@@ -151,13 +193,17 @@ class Decoder:
         except Exception as e:  # backend raises many types; never crash the FS
             self.stats["failed"] += 1
             msg = f"{type(e).__name__}: {e}"
-            log.warning("decode failed, serving original bytes: %s: %s", path, msg)
+            if self.on_decode_error == "error":
+                log.warning("decode failed, returning EIO: %s: %s", path, msg)
+            else:
+                log.warning("decode failed, serving original bytes: %s: %s",
+                            path, msg)
             if self.disk is not None:
                 try:
                     self.disk.put_fail(sha, msg)
                 except OSError as we:
                     log.error("disk cache write failed: %s", we)
-            return None
+            raise DecodeError(errno.EIO, f"cannot decode {path}: {msg}") from e
 
         shebang, _ = detect.split_shebang(raw)
         out = shebang + text.encode("utf-8", "surrogateescape")

@@ -5,8 +5,9 @@ Usage:
 
 Everything under ``root`` is mirrored read-only. Files whose header looks like
 ionCube (any name or extension: encoded CLI scripts often have none) are
-decoded with ioncube_re on first access; if decoding fails, the original bytes
-are served and the failure is logged.
+decoded with ioncube_re on first access.  If decoding fails, reads return EIO
+by default; set -o on_decode_error=original to serve the original bytes
+instead.
 """
 import errno
 import logging
@@ -17,7 +18,7 @@ import threading
 
 import fuse
 
-from .decoder import Decoder
+from .decoder import DECODE_ERROR_MODES, DecodeError, Decoder
 
 fuse.fuse_python_api = (0, 2)
 
@@ -61,10 +62,11 @@ def _erofs(self, *a, **kw):
     return -errno.EROFS
 
 
-def _prewarm_one(cache_dir, chunk, keymap, path):
+def _prewarm_one(cache_dir, chunk, keymap, on_decode_error, path):
     """Worker-process entry: decode one file into the shared disk cache."""
     logging.getLogger("ioncubefs").setLevel(logging.WARNING)
-    d = Decoder(cache_dir, mem_bytes=0, chunk=chunk, keymap=keymap)
+    d = Decoder(cache_dir, mem_bytes=0, chunk=chunk, keymap=keymap,
+                on_decode_error=on_decode_error)
     d.decode(path)
     return path
 
@@ -81,6 +83,7 @@ class IoncubeFS(fuse.Fuse):
         self.ext = None
         self.prewarm = None
         self.keymap = None
+        self.on_decode_error = "error"
         self.log = None
         self.loglevel = "info"
         self.decoder: Decoder | None = None
@@ -119,12 +122,18 @@ class IoncubeFS(fuse.Fuse):
                 if p != self.root and not p.startswith(self.root + os.sep):
                     raise SystemExit(f"ioncubefs: keymap path escapes root: {k!r}")
                 self._keymap[p] = iv
+        self.on_decode_error = str(self.on_decode_error or "error").lower()
+        if self.on_decode_error not in DECODE_ERROR_MODES:
+            raise SystemExit(
+                "ioncubefs: on_decode_error must be error or original")
         cache_dir = None if self.no_disk_cache else os.path.expanduser(self.cache_dir)
         self.decoder = Decoder(cache_dir, mem_bytes=int(self.mem_cache_mb) << 20,
-                               chunk=int(self.chunk), keymap=self._keymap)
+                               chunk=int(self.chunk), keymap=self._keymap,
+                               on_decode_error=self.on_decode_error)
         self._cache_dir = cache_dir
-        log.info("root=%s cache_dir=%s keymap=%d", self.root,
-                 cache_dir or "(disabled)", len(self._keymap))
+        log.info("root=%s cache_dir=%s keymap=%d on_decode_error=%s", self.root,
+                 cache_dir or "(disabled)", len(self._keymap),
+                 self.on_decode_error)
 
     def fsinit(self):
         # Runs after libfuse daemonizes, so background work started here survives.
@@ -154,14 +163,17 @@ class IoncubeFS(fuse.Fuse):
             import concurrent.futures as cf
             import multiprocessing as mp
             with cf.ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) as ex:
-                futs = [ex.submit(_prewarm_one, self._cache_dir, self.decoder.chunk,
-                                  self._keymap, p) for p in paths]
+                futs = [ex.submit(_prewarm_one, self._cache_dir,
+                                  self.decoder.chunk, self._keymap,
+                                  self.on_decode_error, p) for p in paths]
                 for f in cf.as_completed(futs):
                     if f.exception():
                         log.warning("prewarm worker error: %s", f.exception())
         for p in paths:  # pull into memory (cheap when disk-cached)
             try:
                 self.decoder.decode(p)
+            except DecodeError:
+                log.debug("prewarm: decode failed: %s", p)
             except Exception:
                 log.exception("prewarm %s", p)
         log.info("prewarm done: %s", self.decoder.stats)
@@ -190,7 +202,12 @@ class IoncubeFS(fuse.Fuse):
     def getattr(self, path):
         real = self._real(path)
         st = os.lstat(real)
-        data = self._decoded(real, st)
+        # A failed decode still gets its original stat data; the read below
+        # is what returns EIO.  This keeps directory listings usable.
+        try:
+            data = self._decoded(real, st)
+        except DecodeError:
+            data = None
         return _to_stat(st, None if data is None else len(data))
 
     @_guard
@@ -272,7 +289,7 @@ def main(argv=None):
     p.add_option(mountopt="chunk", metavar="N",
                  help="ICB0 production files: which version chunk to decode [1]")
     p.add_option(mountopt="ext", metavar="LIST",
-                 help="only consider these extensions, e.g. .php,.inc "
+                 help="only consider these extensions, e.g. .php:.inc "
                       "[default: sniff every file]")
     p.add_option(mountopt="prewarm", metavar="[N]",
                  help="decode the whole tree in the background at mount, "
@@ -281,6 +298,9 @@ def main(argv=None):
                  help="JSON map of path (relative to root) -> ierg override, "
                       "e.g. {\"functions.inc/IoncubeLicenseLoader.php\": \"0x363de0\"} "
                       "for license-bound/dynamic-key files")
+    p.add_option(mountopt="on_decode_error", metavar="MODE",
+                 help="encoded file that fails to decode: error returns EIO "
+                      "on read; original serves the original bytes [error]")
     p.add_option(mountopt="log", metavar="FILE", help="log to FILE instead of stderr")
     p.add_option(mountopt="loglevel", metavar="LEVEL", help="debug|info|warning [info]")
     server.parse(values=server, errex=1)

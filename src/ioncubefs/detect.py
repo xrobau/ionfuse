@@ -1,7 +1,8 @@
 """Cheap header sniffing for ionCube-encoded PHP files.
 
-This is only a pre-filter: the decoder is the real arbiter, and a file that
-sniffs positive but fails to decode is served as its original bytes.
+This is only a pre-filter: the decoder is the real arbiter.  A file that
+sniffs positive but fails to decode returns EIO on read by default; the
+on_decode_error=original mount option serves the original bytes instead.
 """
 import re
 

@@ -10,7 +10,8 @@ MISSING = object()
 class MemLRU:
     """Thread-safe LRU bounded by the total size of the cached values.
 
-    Values are ``bytes`` or ``None`` (a negative entry: not encoded / failed).
+    Values are ``bytes``, ``None`` (not encoded), or the decoder's failure
+    sentinel.
     """
 
     def __init__(self, max_bytes: int):
